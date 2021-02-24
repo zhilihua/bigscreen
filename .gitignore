@@ -1,0 +1,10 @@
+/target
+/*/target
+/logs
+/*/logs
+
+/.idea
+/*/.idea
+/*.iml
+/*/*.iml
+/metastore_db

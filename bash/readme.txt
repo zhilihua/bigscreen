@@ -1,0 +1,1 @@
+sh application_submit.sh > log_$(date +%y%m%d).txt.out 2>&1 &
