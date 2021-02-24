@@ -6,7 +6,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Properties
 
 import com.alibaba.fastjson.JSON
-import com.gkgd.bigscreen.constant.{ConfigConstant, KafkaConstant}
+import com.gkgd.bigscreen.constant.KafkaConstant
 import com.gkgd.bigscreen.entity.dwd.DataBusBean
 import com.gkgd.bigscreen.util.{MyKafkaUtil, PropertiesUtil}
 import org.apache.kafka.clients.consumer.ConsumerRecord
@@ -20,15 +20,12 @@ import scala.collection.mutable
 
 object DwdVehicleStopHistory {
     def main(args: Array[String]): Unit = {
-        val properties: Properties = PropertiesUtil.load("config.properties")
-        val hiveMetastore = properties.getProperty(ConfigConstant.HIVE_METASTORE_URIS)
-        val hiveDatabase = properties.getProperty(ConfigConstant.HIVE_DATABASE)
         val spark = SparkSession.builder()
             .appName("HiveWrite")
-//            .master("local[*]")
+            //            .master("local[*]")
             .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-            .config("hive.metastore.uris", hiveMetastore)
-//            .config("spark.sql.warehouse.dir", "http://192.168.10.20:8080/#/main/dashboard/metrics")
+            .config("hive.metastore.uris", "thrift://192.168.10.21:9083")
+            .config("spark.sql.warehouse.dir", "http://192.168.10.20:8080/#/main/dashboard/metrics")
             .config("hive.exec.dynamic.partition.mode", "nonstrict")
             .enableHiveSupport()
             .getOrCreate()
@@ -37,6 +34,7 @@ object DwdVehicleStopHistory {
 
         val ssc = new StreamingContext(sparkConf, Seconds(5))
 
+        val properties: Properties = PropertiesUtil.load("config.properties")
         val topic = properties.getProperty(KafkaConstant.TOPIC_DWD_DATA_BUS)
         val groupId = "writeHive0"
 
@@ -55,7 +53,11 @@ object DwdVehicleStopHistory {
                     val dataBusBean: DataBusBean = JSON.parseObject(jsonString, classOf[DataBusBean])
                     dataBusBean
                 }
-            }
+            }.filter(
+                record => {
+                    "1".equals(record.manage_state) && "1".equals(record.audit_state)
+                }
+            )
         }).mapPartitions(partRDD => {
             val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
             val lst = mutable.Map[String, VehicleStopHistory]()
@@ -80,7 +82,7 @@ object DwdVehicleStopHistory {
                         //如果上次没有，只关注此时停止状态(类似初始化)
                         speed match {
                             case start if start.toDouble > 0 =>
-                                //如果此刻处于运行状态，不做任何操作
+                            //如果此刻处于运行状态，不做任何操作
 
                             case stop if stop.toDouble == 0 =>
                                 //将停车数据进行记录
@@ -131,75 +133,14 @@ object DwdVehicleStopHistory {
         recordStream.foreachRDD(rdd => {
             //拉取各个分区数据
             val strMap = rdd.collect
-            if (strMap.length > 0) {
-//                spark.createDataFrame(strMap.map(_._2)).show()
-                //获取需要落地的数据
-                val historyMap = strMap.map(_._2).filter(info => {
-                    val key = info.start_time
-                    key != null
-                })
 
-                //获取需要与广播变量合并的数据
-                val combineMap = strMap.filter(info => {
-                    info._2.start_time == null
-                }).toMap
-
-                //过滤掉过期的数据
-                val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                val now = LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                val nowTimeStamp = sdf.parse(now).getTime
-
-                //过期的数据
-                val delData = orgData.filter(info => {
-                    (nowTimeStamp - sdf.parse(info._2.create_time).getTime) / 1000 > 180
-                }).keys
-
-                if(delData.nonEmpty) {
-                    //减去过期数据
-                    orgData --= delData
-                }
-                if(historyMap.length>0){
-                    //减去已经记录过的数据
-                    orgData --= historyMap.map(_.vehicle_id)
-                }
-
-                //合并生产新的广播变量
-                orgData ++= combineMap
-
-                if(historyMap.length > 0) {
-                    //如果有数据才落地(数据为停车时间大于3分钟的)
-                    val histories = historyMap.filter(info => {
-                        val timeOut = (sdf.parse(info.start_time).getTime - sdf.parse(info.stop_time).getTime) / 1000
-                        timeOut > 180
-                    })
-
-                    if(histories.length > 0) {
-                        val df: DataFrame = spark.createDataFrame(histories)
-                        //落地到hive
-                        df.write.format("hive").mode("append").partitionBy("month_id", "day_id","hour_id")
-                            .saveAsTable(hiveDatabase+".dwd_cwp_d_vehicle_stop_history")
-                        df.show()
-                    }
-                }
-
-                instance = vehicleStopList.getInstance(sparkConf, orgData)
-            }else{
-                //只检查过期的进行过滤
-                //过滤掉过期的数据
-                val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                val now = LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                val nowTimeStamp = sdf.parse(now).getTime
-                //过期的数据
-                val delData = orgData.filter(info => {
-                    (nowTimeStamp - sdf.parse(info._2.create_time).getTime) / 1000 > 180
-                }).keys
-
-                if(delData.nonEmpty) {
-                    orgData --= delData
-                }
-
-                instance = vehicleStopList.getInstance(sparkConf, orgData)
-            }
+            val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+            val now = LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+            val nowTimeStamp = sdf.parse(now).getTime
+            val delData = orgData.filter(info => {
+                (nowTimeStamp - sdf.parse(info._2.create_time).getTime) / 1000 > 180
+            }).keys
+            orgData --= delData
 
         })
 
@@ -210,21 +151,21 @@ object DwdVehicleStopHistory {
 }
 
 case class VehicleStopHistory(
-                 vehicle_id: String,
-                 enterprise_id: String,
-                 car_card_number: String,
-                 stop_time: String,
-                 stop_lng: Double,
-                 stop_lat: Double,
-                 var start_time: String,
-                 var start_lng: Double,
-                 var start_lat: Double,
-                 var create_time: String,    //系统时间
-                 dept_id: Int,
-                 department_id: Int,
-                 var month_id: String,
-                 var day_id: String,
-                 var hour_id: String)
+                                 vehicle_id: String,
+                                 enterprise_id: String,
+                                 car_card_number: String,
+                                 stop_time: String,
+                                 stop_lng: Double,
+                                 stop_lat: Double,
+                                 var start_time: String,
+                                 var start_lng: Double,
+                                 var start_lat: Double,
+                                 var create_time: String,    //系统时间
+                                 dept_id: Int,
+                                 department_id: Int,
+                                 var month_id: String,
+                                 var day_id: String,
+                                 var hour_id: String)
 //广播变量供executor使用
 object vehicleStopList {
     //动态更新广播变量
